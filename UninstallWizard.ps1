@@ -3,7 +3,7 @@
 # Last Edited 15.10.2026
 #
 
-$VERSION     = "1.1.0" 
+$VERSION     = "1.2.0" 
 $DEKO        = "-----------------------------------------------------------------"
 $EMPTY_LINE  = "                                                                 "
 $Host.UI.RawUI.ForegroundColor = 'Blue'
@@ -41,7 +41,7 @@ $targets = @(
     @{ Name = 'Firefox'; Pattern = '^Mozilla Firefox'; Kind = 'Registry' }
     @{ Name = 'Google Chrome'; Pattern = '^Google Chrome$'; Kind = 'Registry' }
     @{ Name = '7-Zip'; Pattern = '^7-Zip'; Kind = 'Registry' }
-    @{ Name = 'TeamViewer'; Pattern = '^TeamViewer$'; Kind = 'Registry' }
+    @{ Name = 'TeamViewer'; Pattern = '^TeamViewer(?:\s|$)'; ExcludePattern = '^TeamViewer Host(?:\s|$)'; Kind = 'Registry' }
     @{ Name = 'PDF-XChange Editor'; Pattern = '^PDF-XChange Editor'; Kind = 'Registry' }
     @{ Name = 'Adobe Reader'; Pattern = '^Adobe Acrobat'; Kind = 'Registry' }
     @{ Name = 'TeamViewer Host'; Pattern = '^TeamViewer Host'; Kind = 'Registry' }
@@ -50,7 +50,9 @@ $targets = @(
     @{ Name = 'Nextcloud'; Pattern = '^Nextcloud'; Kind = 'Registry' }
     @{ Name = 'KeePass'; Pattern = '^KeePass 2'; Kind = 'Registry' }
     @{ Name = 'KeePassXC'; Pattern = '^KeePassXC'; Kind = 'Registry' }
-    @{ Name = 'DATEV Sicherheitspaket Compact'; Pattern = '^DATEV Sicherheitspaket Compact'; Kind = 'Registry' }
+    @{ Name = 'DATEV Sicherheitspaket Compact'; Pattern = '^(?:DATEV\s+)?Sicherheitspaket\s+compact(?:\s|$)'; Publisher = '^DATEV(?:\s+eG)?$'; Kind = 'Registry' }
+    @{ Name = 'Adobe Express / Photoshop'; Pattern = '^(?:Adobe Express|Adobe Photoshop(?: Express)?)(?:\s|$)'; Kind = 'Registry' }
+    @{ Name = 'Adobe Photoshop Express'; PackageName = 'AdobeSystemsIncorporated.AdobePhotoshopExpress'; Kind = 'Appx' }
     @{ Name = 'LibreOffice'; Pattern = '^LibreOffice'; Kind = 'Registry' }
 )
 
@@ -64,30 +66,97 @@ $installed = @(
     foreach ($path in $registryPaths) {
         Get-ItemProperty $path -ErrorAction SilentlyContinue |
             Where-Object {
-                $_.DisplayName -and
-                ($_.UninstallString -or $_.QuietUninstallString)
+                $_.DisplayName
             }
     }
 )
 
 $items = @(
     foreach ($i in $targets) {
+        if ($i.Kind -eq 'Appx') {
+            $matchesItem = @(Get-AppxPackage -Name $i.PackageName -ErrorAction Stop)
+            foreach ($app in $matchesItem) {
+                [PSCustomObject]@{
+                    Label    = "$($i.Name) [$($app.Name)]"
+                    Name     = $i.Name
+                    Target   = $i.Name
+                    Entry    = $app
+                    Kind     = $i.Kind
+                    Selected = $false
+                }
+            }
+            continue
+        }
+
         $matchesItem = @(
             $installed | Where-Object {
-                $_.DisplayName -match $i.Pattern
+                $_.DisplayName -match $i.Pattern -and
+                (-not $i.ExcludePattern -or $_.DisplayName -notmatch $i.ExcludePattern) -and
+                (-not $i.Publisher -or $_.Publisher -match $i.Publisher)
             }
         )
 
+        if ($i.Name -eq 'DATEV Sicherheitspaket Compact') {
+            $preferredDatevUninstallers = @(
+                foreach ($entry in $matchesItem) {
+                    $uninstallerMatch = [regex]::Match(
+                        [string]$entry.QuietUninstallString,
+                        '^\s*"([^"]+)"'
+                    )
+                    if (
+                        $uninstallerMatch.Success -and
+                        [IO.Path]::GetFileName($uninstallerMatch.Groups[1].Value) -ieq 'SiPacompact.exe' -and
+                        (Test-Path -LiteralPath $uninstallerMatch.Groups[1].Value -PathType Leaf)
+                    ) {
+                        $entry
+                    }
+                }
+            )
+            if ($preferredDatevUninstallers.Count -gt 0) {
+                $matchesItem = @($preferredDatevUninstallers | Select-Object -First 1)
+            }
+        }
+
         foreach ($app in $matchesItem) {
+            $hasMsiProductCode = $app.PSChildName -match '^\{[0-9A-Fa-f-]{36}\}$'
+            $hasKnownUninstallerFallback = $i.Name -in @(
+                'Firefox'
+                'TeamViewer'
+                'TeamViewer Host'
+            )
+
+            if (
+                -not $app.UninstallString -and
+                -not $app.QuietUninstallString -and
+                -not $hasMsiProductCode -and
+                -not $hasKnownUninstallerFallback
+            ) {
+                continue
+            }
+
             [PSCustomObject]@{
                 Label   = "$($i.Name) [$($app.DisplayName)]"
                 Name    = $app.DisplayName
+                Target  = $i.Name
                 Entry   = $app
+                Kind    = $i.Kind
                 Selected = $false
             }
         }
     }
 )
+
+$publicTeamViewerPath = Join-Path $env:PUBLIC 'Desktop\TeamViewer_ECE.exe'
+if (Test-Path -LiteralPath $publicTeamViewerPath -PathType Leaf) {
+    $items += [PSCustomObject]@{
+        Label    = 'TeamViewer executable [Public Desktop]'
+        Name     = 'TeamViewer_ECE.exe (Public Desktop)'
+        Target   = 'TeamViewer'
+        Entry    = $publicTeamViewerPath
+        Kind     = 'DesktopExecutable'
+        Selected = $false
+    }
+}
 
 if ($items.Count -eq 0) {
     Write-Host 'Programme nicht gefunden!' -ForegroundColor Red
@@ -162,16 +231,36 @@ foreach ($item in $selected) {
     $app = $item.Entry
 
     Write-Host $DEKO
-    Write-Host "Entferne $($app.DisplayName)..." -ForegroundColor Cyan
+    Write-Host "Entferne $($item.Name)..." -ForegroundColor Cyan
 
     try {
-        $command = if ($app.QuietUninstallString) {
-            $app.QuietUninstallString
-        } else {
-            $app.UninstallString
+        if ($item.Kind -eq 'Appx') {
+            Remove-AppxPackage -Package $app.PackageFullName -ErrorAction Stop
+            if (Get-AppxPackage -Name $app.Name -ErrorAction Stop) {
+                throw "Adobe-App-Paket $($app.Name) ist nach der Deinstallation noch vorhanden."
+            }
+            Write-Host "Abgeschlossen: $($app.Name)" -ForegroundColor Green
+            continue
         }
 
-        if ($command -match '(?i)\bmsiexec(?:\.exe)?\b') {
+        if ($item.Kind -eq 'DesktopExecutable') {
+            Remove-Item -LiteralPath $app -Force -ErrorAction Stop
+            if (Test-Path -LiteralPath $app) {
+                throw "TeamViewer-Datei $app ist nach dem Entfernen noch vorhanden."
+            }
+            Write-Host "Entfernt: $app" -ForegroundColor Green
+            continue
+        }
+
+        $command = $app.QuietUninstallString
+        if (-not $command) {
+            $command = $app.UninstallString
+        }
+
+        if (
+            $command -match '(?i)\bmsiexec(?:\.exe)?\b' -or
+            (-not $command -and $app.PSChildName -match '^\{[0-9A-Fa-f-]{36}\}$')
+        ) {
             $guid = [regex]::Match(
                 $command,
                 '\{[0-9A-Fa-f-]{36}\}'
@@ -191,6 +280,83 @@ foreach ($item in $selected) {
             $proc = Start-Process -FilePath 'msiexec.exe' `
                 -ArgumentList "/x $guid /qn /norestart" `
                 -Wait -PassThru
+
+        } elseif ($item.Target -eq 'Firefox' -and -not $app.QuietUninstallString) {
+            $installLocation = [Environment]::ExpandEnvironmentVariables(
+                [string]$app.InstallLocation
+            ).Trim('"')
+            $candidatePaths = @()
+
+            if ($installLocation) {
+                $candidatePaths += Join-Path $installLocation 'uninstall\helper.exe'
+            }
+
+            if ($command -match '^\s*"([^"]+helper\.exe)"') {
+                $candidatePaths += $Matches[1]
+            } elseif ($command -match '^\s*(.+?helper\.exe)(?:\s|$)') {
+                $candidatePaths += $Matches[1]
+            }
+
+            $knownInstallRoots = @(
+                $env:ProgramFiles
+                ${env:ProgramFiles(x86)}
+                $env:LOCALAPPDATA
+            ) | Where-Object { $_ }
+            foreach ($root in $knownInstallRoots) {
+                $candidatePaths += Join-Path $root 'Mozilla Firefox\uninstall\helper.exe'
+            }
+
+            $uninstaller = $candidatePaths |
+                Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } |
+                Select-Object -First 1
+
+            if (-not $uninstaller) {
+                throw "Firefox helper.exe wurde nicht im Installationsverzeichnis gefunden."
+            }
+
+            $proc = Start-Process -FilePath $uninstaller `
+                -ArgumentList '/S' -Wait -PassThru
+
+        } elseif ($item.Target -in @('TeamViewer', 'TeamViewer Host') -and -not $app.QuietUninstallString) {
+            $installLocation = [Environment]::ExpandEnvironmentVariables(
+                [string]$app.InstallLocation
+            ).Trim('"')
+            $candidatePaths = @()
+
+            if ($command -match '^\s*"([^"]+\.exe)"') {
+                $candidatePaths += $Matches[1]
+            } elseif ($command -match '^\s*(.+?\.exe)(?:\s|$)') {
+                $candidatePaths += $Matches[1]
+            }
+
+            if ($installLocation) {
+                $candidatePaths += Join-Path $installLocation 'uninstall.exe'
+            }
+
+            $programFilesRoots = @($env:ProgramFiles, ${env:ProgramFiles(x86)}) |
+                Where-Object { $_ }
+            foreach ($root in $programFilesRoots) {
+                if ($item.Target -eq 'TeamViewer Host') {
+                    $candidatePaths += Join-Path $root 'TeamViewer Host\uninstall.exe'
+                } else {
+                    $candidatePaths += Join-Path $root 'TeamViewer\uninstall.exe'
+                }
+            }
+
+            $uninstaller = $candidatePaths |
+                Where-Object {
+                    $_ -and
+                    (Test-Path -LiteralPath $_ -PathType Leaf) -and
+                    [IO.Path]::GetFileName($_) -match '^(?:uninstall|unins\d*)\.exe$'
+                } |
+                Select-Object -First 1
+
+            if (-not $uninstaller) {
+                throw "TeamViewer-Uninstaller wurde im Installationsverzeichnis nicht gefunden."
+            }
+
+            $proc = Start-Process -FilePath $uninstaller `
+                -ArgumentList '/S' -Wait -PassThru
 
         } else {
             if (-not $app.QuietUninstallString) {
@@ -222,6 +388,45 @@ foreach ($item in $selected) {
     catch {
         Write-Host "Fehler bei $($app.DisplayName): $($_.Exception.Message)" `
             -ForegroundColor Red
+    }
+}
+
+if ($selected | Where-Object { $_.Target -eq 'TeamViewer' }) {
+    $desktopPaths = @(
+        (Join-Path $env:PUBLIC 'Desktop\TeamViewer_ECE.exe')
+        (Join-Path ([Environment]::GetFolderPath('Desktop')) 'TeamViewer_ECE.exe')
+    ) | Select-Object -Unique
+
+    foreach ($desktopPath in $desktopPaths) {
+        if (-not (Test-Path -LiteralPath $desktopPath -PathType Leaf)) {
+            continue
+        }
+
+        try {
+            Remove-Item -LiteralPath $desktopPath -Force -ErrorAction Stop
+            Write-Host "Entfernt: $desktopPath" -ForegroundColor Green
+        }
+        catch {
+            Write-Host "Fehler beim Entfernen von $desktopPath`: $($_.Exception.Message)" `
+                -ForegroundColor Red
+        }
+    }
+}
+
+if ($selected | Where-Object {
+    $_.Target -in @('Adobe Express / Photoshop', 'Adobe Photoshop Express')
+}) {
+    $desktopPath = Join-Path ([Environment]::GetFolderPath('Desktop')) `
+        'Adobe Express Photos.lnk'
+    if (Test-Path -LiteralPath $desktopPath -PathType Leaf) {
+        try {
+            Remove-Item -LiteralPath $desktopPath -Force -ErrorAction Stop
+            Write-Host "Entfernt: $desktopPath" -ForegroundColor Green
+        }
+        catch {
+            Write-Host "Fehler beim Entfernen von $desktopPath`: $($_.Exception.Message)" `
+                -ForegroundColor Red
+        }
     }
 }
 
