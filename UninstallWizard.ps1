@@ -39,6 +39,9 @@ Add-Type -AssemblyName System.Drawing
 ## Apps Software targets.
 $targets = @(
     @{ Name = 'Firefox'; Pattern = '^Mozilla Firefox'; Kind = 'Registry' }
+    @{ Name = 'Thunderbird'; Pattern = '^Mozilla Thunderbird'; Kind = 'Registry' }
+    @{ Name = 'Brother iPrint&Scan'; Pattern = '^Brother iPrint(?:&| and )Scan(?:\s|$)'; Kind = 'Registry' }
+    @{ Name = 'Brother iPrint&Scan'; PackagePattern = '^Brother.*iPrint.*Scan'; Kind = 'Appx' }
     @{ Name = 'Google Chrome'; Pattern = '^Google Chrome$'; Kind = 'Registry' }
     @{ Name = '7-Zip'; Pattern = '^7-Zip'; Kind = 'Registry' }
     @{ Name = 'TeamViewer'; Pattern = '^TeamViewer(?:\s|$)'; ExcludePattern = '^TeamViewer Host(?:\s|$)'; Kind = 'Registry' }
@@ -55,6 +58,27 @@ $targets = @(
     @{ Name = 'Adobe Photoshop Express'; PackageName = 'AdobeSystemsIncorporated.AdobePhotoshopExpress'; Kind = 'Appx' }
     @{ Name = 'LibreOffice'; Pattern = '^LibreOffice'; Kind = 'Registry' }
 )
+
+$processNamesByTarget = @{
+    'Firefox'                         = @('firefox.exe')
+    'Thunderbird'                     = @('thunderbird.exe')
+    'Brother iPrint&Scan'             = @('iPrintScan.exe', 'Brother iPrint&Scan.exe')
+    'Google Chrome'                   = @('chrome.exe')
+    '7-Zip'                           = @('7z.exe', '7zFM.exe', '7zG.exe')
+    'TeamViewer'                      = @('TeamViewer.exe', 'tv_w32.exe', 'tv_x64.exe')
+    'PDF-XChange Editor'              = @('PDFXEdit.exe', 'PDFXCview.exe')
+    'Adobe Reader'                    = @('AcroRd32.exe', 'Acrobat.exe')
+    'TeamViewer Host'                 = @('TeamViewer.exe', 'TeamViewer_Service.exe', 'tv_w32.exe', 'tv_x64.exe')
+    'PDF24'                           = @('pdf24.exe', 'pdf24-DocTool.exe', 'pdf24-Assistant.exe')
+    'WireGuard'                       = @('wireguard.exe')
+    'Nextcloud'                       = @('nextcloud.exe', 'nextcloudcmd.exe')
+    'KeePass'                         = @('KeePass.exe')
+    'KeePassXC'                       = @('KeePassXC.exe')
+    'DATEV Sicherheitspaket Compact'  = @('SiPacompact.exe')
+    'Adobe Express / Photoshop'       = @('Photoshop.exe', 'AdobePhotoshopExpress.exe')
+    'Adobe Photoshop Express'         = @('AdobePhotoshopExpress.exe', 'PhotoshopExpress.exe')
+    'LibreOffice'                     = @('soffice.exe', 'soffice.bin')
+}
 
 $registryPaths = @(
     'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
@@ -74,7 +98,12 @@ $installed = @(
 $items = @(
     foreach ($i in $targets) {
         if ($i.Kind -eq 'Appx') {
-            $matchesItem = @(Get-AppxPackage -Name $i.PackageName -ErrorAction Stop)
+            if ($i.PackagePattern) {
+                $matchesItem = @(Get-AppxPackage -ErrorAction Stop |
+                    Where-Object { $_.Name -match $i.PackagePattern })
+            } else {
+                $matchesItem = @(Get-AppxPackage -Name $i.PackageName -ErrorAction Stop)
+            }
             foreach ($app in $matchesItem) {
                 [PSCustomObject]@{
                     Label    = "$($i.Name) [$($app.Name)]"
@@ -121,6 +150,7 @@ $items = @(
             $hasMsiProductCode = $app.PSChildName -match '^\{[0-9A-Fa-f-]{36}\}$'
             $hasKnownUninstallerFallback = $i.Name -in @(
                 'Firefox'
+                'Thunderbird'
                 'TeamViewer'
                 'TeamViewer Host'
             )
@@ -156,6 +186,141 @@ if (Test-Path -LiteralPath $publicTeamViewerPath -PathType Leaf) {
         Kind     = 'DesktopExecutable'
         Selected = $false
     }
+}
+
+function Get-RunningSoftwareProcesses {
+    param($Item)
+
+    $processNames = @($processNamesByTarget[$Item.Target])
+    $installationLocation = [Environment]::ExpandEnvironmentVariables(
+        [string]$Item.Entry.InstallLocation
+    ).Trim().Trim('"')
+    $installationPrefix = $null
+
+    if (
+        $installationLocation -and
+        (Test-Path -LiteralPath $installationLocation -PathType Container)
+    ) {
+        $installationPrefix = [IO.Path]::GetFullPath($installationLocation).TrimEnd('\') + '\'
+    }
+
+    $processSnapshot = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop)
+    @(
+        $processSnapshot | Where-Object {
+            $isKnownProcess = $processNames -contains [string]$_.Name
+            $isInInstallationFolder = $false
+            if ($installationPrefix -and $_.ExecutablePath) {
+                $isInInstallationFolder = ([string]$_.ExecutablePath).StartsWith(
+                    $installationPrefix,
+                    [StringComparison]::OrdinalIgnoreCase
+                )
+            }
+
+            $isKnownProcess -or $isInInstallationFolder
+        }
+    )
+}
+
+function Get-ProcessTreeIds {
+    param(
+        [object[]]$ProcessSnapshot,
+        [int[]]$RootProcessIds
+    )
+
+    $treeIds = @{}
+    foreach ($rootProcessId in $RootProcessIds) {
+        $treeIds[$rootProcessId] = $true
+    }
+
+    do {
+        $foundChild = $false
+        foreach ($process in $ProcessSnapshot) {
+            $processId = [int]$process.ProcessId
+            $parentProcessId = [int]$process.ParentProcessId
+            if ($treeIds.ContainsKey($parentProcessId) -and -not $treeIds.ContainsKey($processId)) {
+                $treeIds[$processId] = $true
+                $foundChild = $true
+            }
+        }
+    } while ($foundChild)
+
+    @($treeIds.Keys | ForEach-Object { [int]$_ })
+}
+
+function Stop-SelectedSoftwareProcesses {
+    param($Item)
+
+    if ($Item.Kind -eq 'DesktopExecutable') {
+        return $true
+    }
+
+    $runningProcesses = @(Get-RunningSoftwareProcesses -Item $Item)
+    if ($runningProcesses.Count -eq 0) {
+        return $true
+    }
+
+    $initialSnapshot = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop)
+    $rootProcessIds = @($runningProcesses | ForEach-Object { [int]$_.ProcessId })
+    $processTreeIds = @(Get-ProcessTreeIds -ProcessSnapshot $initialSnapshot -RootProcessIds $rootProcessIds)
+
+    foreach ($processId in $rootProcessIds) {
+        $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
+        if ($process -and $process.MainWindowHandle -ne 0) {
+            [void]$process.CloseMainWindow()
+        }
+    }
+
+    $gracePeriodEnd = (Get-Date).AddSeconds(5)
+    do {
+        $remainingRoots = @(
+            foreach ($processId in $rootProcessIds) {
+                if (Get-Process -Id $processId -ErrorAction SilentlyContinue) {
+                    $processId
+                }
+            }
+        )
+        if ($remainingRoots.Count -eq 0) {
+            break
+        }
+        Start-Sleep -Milliseconds 250
+    } while ((Get-Date) -lt $gracePeriodEnd)
+
+    $latestSnapshot = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop)
+    $processTreeIds = @(Get-ProcessTreeIds -ProcessSnapshot $latestSnapshot -RootProcessIds $processTreeIds)
+    $liveTreeProcesses = @(
+        $latestSnapshot | Where-Object { $processTreeIds -contains [int]$_.ProcessId }
+    )
+    $taskkillPath = Join-Path $env:SystemRoot 'System32\taskkill.exe'
+
+    foreach ($process in $liveTreeProcesses) {
+        $processId = [int]$process.ProcessId
+        $stillRunning = Get-CimInstance -ClassName Win32_Process `
+            -Filter "ProcessId = $processId" -ErrorAction Stop
+        if (-not $stillRunning) {
+            continue
+        }
+
+        $killProcess = Start-Process -FilePath $taskkillPath `
+            -ArgumentList @('/PID', [string]$processId, '/T', '/F') `
+            -Wait -PassThru -ErrorAction Stop
+        if ($killProcess.ExitCode -ne 0) {
+            $stillRunning = Get-CimInstance -ClassName Win32_Process `
+                -Filter "ProcessId = $processId" -ErrorAction Stop
+            if ($stillRunning) {
+                throw "Prozess $($process.Name) konnte nicht beendet werden."
+            }
+        }
+    }
+
+    $remainingProcesses = @(Get-RunningSoftwareProcesses -Item $Item)
+    if ($remainingProcesses.Count -gt 0) {
+        $remainingSummary = ($remainingProcesses |
+            ForEach-Object { $_.Name }) -join ', '
+        throw "Softwareprozesse laufen weiterhin: $remainingSummary"
+    }
+
+    Write-Host "Beendet: $($Item.Name) und zugehoerige Prozesse." -ForegroundColor Yellow
+    return $true
 }
 
 if ($items.Count -eq 0) {
@@ -215,8 +380,25 @@ if ($selected.Count -eq 0) {
 
 # Explicit confirmation before making changes
 $names = ($selected | ForEach-Object { $_.Name }) -join "`n"
+$runningSoftware = @(
+    foreach ($item in $selected) {
+        if ($item.Kind -eq 'DesktopExecutable') {
+            continue
+        }
+        $processes = @(Get-RunningSoftwareProcesses -Item $item)
+        if ($processes.Count -gt 0) {
+            $item.Name
+        }
+    }
+)
+$runningNotice = ''
+if ($runningSoftware.Count -gt 0) {
+    $runningNotice = "`n`nLaufende Software wurde erkannt:`n - " +
+        ($runningSoftware -join "`n - ") +
+        "`nDiese Programme und ihre Kindprozesse werden vor der Deinstallation beendet."
+}
 $confirmation = [System.Windows.Forms.MessageBox]::Show(
-    "Folgende Programme werden deinstalliert:`n`n$names`n`nFortfahren?",
+    "Folgende Programme werden deinstalliert:`n`n$names$runningNotice`n`nFortfahren?",
     'Fortfahren?',
     [System.Windows.Forms.MessageBoxButtons]::YesNo,
     [System.Windows.Forms.MessageBoxIcon]::Warning
@@ -224,6 +406,21 @@ $confirmation = [System.Windows.Forms.MessageBox]::Show(
 
 if ($confirmation -ne [System.Windows.Forms.DialogResult]::Yes) { # not equal = yes
     exit 0 # stop
+}
+
+if ($runningSoftware.Count -gt 0) {
+    $stopConfirmation = [System.Windows.Forms.MessageBox]::Show(
+        "Die ausgewaehlte Software wird automatisch geschlossen, einschliesslich " +
+        "verbleibender Hintergrund- und Kindprozesse:`n`n - " +
+        ($runningSoftware -join "`n - ") +
+        "`n`nFortfahren?",
+        'Laufende Programme schliessen',
+        [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        [System.Windows.Forms.MessageBoxIcon]::Warning
+    )
+    if ($stopConfirmation -ne [System.Windows.Forms.DialogResult]::Yes) {
+        exit 0
+    }
 }
 
 # uinstall block
@@ -234,6 +431,8 @@ foreach ($item in $selected) {
     Write-Host "Entferne $($item.Name)..." -ForegroundColor Cyan
 
     try {
+        [void](Stop-SelectedSoftwareProcesses -Item $item)
+
         if ($item.Kind -eq 'Appx') {
             Remove-AppxPackage -Package $app.PackageFullName -ErrorAction Stop
             if (Get-AppxPackage -Name $app.Name -ErrorAction Stop) {
@@ -281,7 +480,7 @@ foreach ($item in $selected) {
                 -ArgumentList "/x $guid /qn /norestart" `
                 -Wait -PassThru
 
-        } elseif ($item.Target -eq 'Firefox' -and -not $app.QuietUninstallString) {
+        } elseif ($item.Target -in @('Firefox', 'Thunderbird') -and -not $app.QuietUninstallString) {
             $installLocation = [Environment]::ExpandEnvironmentVariables(
                 [string]$app.InstallLocation
             ).Trim('"')
@@ -303,7 +502,12 @@ foreach ($item in $selected) {
                 $env:LOCALAPPDATA
             ) | Where-Object { $_ }
             foreach ($root in $knownInstallRoots) {
-                $candidatePaths += Join-Path $root 'Mozilla Firefox\uninstall\helper.exe'
+                $applicationFolder = if ($item.Target -eq 'Thunderbird') {
+                    'Mozilla Thunderbird'
+                } else {
+                    'Mozilla Firefox'
+                }
+                $candidatePaths += Join-Path $root "$applicationFolder\uninstall\helper.exe"
             }
 
             $uninstaller = $candidatePaths |
@@ -311,7 +515,7 @@ foreach ($item in $selected) {
                 Select-Object -First 1
 
             if (-not $uninstaller) {
-                throw "Firefox helper.exe wurde nicht im Installationsverzeichnis gefunden."
+                throw "$($item.Target) helper.exe wurde nicht im Installationsverzeichnis gefunden."
             }
 
             $proc = Start-Process -FilePath $uninstaller `
